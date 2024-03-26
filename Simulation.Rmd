@@ -310,4 +310,76 @@ forest_cm_test <- confusionMatrix(factor(test_forest_preds), factor(test_data$Y)
 forest_cm_test$table
 forest_cm_test$byClass
 ```
+{r}
+library(ROSE)
+library(themis)
+library(tidymodels)
+library(caret)
 
+# Function to perform oversampling on the training data
+oversample_data <- function(train_data) {
+  # Directly specify N within the ovun.sample call
+  oversampled_data <- ovun.sample(Y ~ ., data = train_data, method = "over", 
+                                  N = table(train_data$Y)[1] + 2*table(train_data$Y)[2])$data
+  return(oversampled_data)
+}
+
+
+
+# Adjusted Function to perform undersampling on the training data
+undersample_data <- function(train_data) {
+  # Calculate N_size directly within the ovun.sample call
+  undersampled_data <- ovun.sample(Y ~ ., data = train_data, method = "under", 
+                                   N = 2 * min(table(train_data$Y)))$data
+  return(undersampled_data)
+}
+
+
+
+# Function to perform SMOTE on the training data, ensuring Y is a factor
+smote_data <- function(train_data) {
+  # Convert Y to a factor if it's not already
+  train_data$Y <- as.factor(train_data$Y)
+
+  # Create a recipe with Y as a factor
+  rec <- recipe(Y ~ ., data = train_data) %>%
+    step_smote(Y)
+
+  # Prepare the recipe with training data
+  prep_rec <- prep(rec, training = train_data)
+
+  # Bake the recipe to apply transformations
+  smoted_data <- bake(prep_rec, new_data = NULL)
+
+  return(smoted_data)
+}
+
+
+# Apply the resampling techniques to the training data
+for (file in list.files("data/")) {
+  # Read the dataset
+  data_path <- file.path("data", file)
+  data <- read.csv(data_path)
+  
+  # Split into train and test sets
+  set.seed(0)
+  train_idx <- createDataPartition(data$Y, p = 0.7, list = FALSE)
+  train_data <- data[train_idx, ]
+  test_data <- data[-train_idx, ]
+  
+  # Apply oversampling
+  oversampled_train_data <- oversample_data(train_data)
+  
+  # Apply undersampling
+  undersampled_train_data <- undersample_data(train_data)
+  
+  # Apply SMOTE
+  smote_train_data <- smote_data(train_data)
+  
+  # Now you can proceed to fit your models on these balanced datasets
+  # Example: Fit a logistic regression model on the oversampled data
+  # logit_model_oversampled <- glm(Y ~ ., data = oversampled_train_data, family = binomial())
+  
+  # Repeat model fitting for undersampled and SMOTE data as needed
+  # Save or evaluate the models as per your research plan
+}
