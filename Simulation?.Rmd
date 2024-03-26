@@ -18,29 +18,54 @@ set.seed(98)
 # Mini simulation to test the p and $\beta_0$ relationship formula
 
 ```{r}
-n_test <- 100000
+# p and beta 0 relationship Monte Carlo test
+set.seed(0)
+n_test <- 10^6
 
 sigmoid <- function(x) {
   return (1 / (1+exp(-x)))
 }
 
-ps <- c(0.5, 0.75, 0.9, 0.95)
-
-for (p in ps) {
-  beta1 <- 0.5
-  beta2 <- 0.5
+get_beta0 <- function(beta1, beta2) {
   
-  X1 <- rnorm(n_test, 0, 2)
-  X2 <- rexp(n_test, 0.5) - 2
+  # grid of beta 0 to try
+  beta0_vec <- seq(-10, 10, 0.1) 
   
-  beta0 <- qnorm(p) * sqrt((sqrt(pi / 8))^(-2) + (beta1^2*4+beta2^2*4))
+  # placeholder p vector
+  ps <- rep(NA, length(beta0_vec))
   
-  probs <- sigmoid(beta0 + beta1 * X1 + beta2 * X2)
+  # get empircal proportion for each beta0
+  for (i in 1:length(beta0_vec)) {
+    X1 <- rnorm(n, 0, 2)
+    X2 <- rexp(n, 0.5) - 2
+    
+    probs <- sigmoid(beta0_vec[i] + beta1 * X1 + beta2 * X2)
+    
+    Y <- rbinom(n, 1, probs)
+    
+    ps[i] <- mean(Y)
+  }
   
-  Y <- rbinom(n_test, 1, probs)
+  desired_p <- c(0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95)
+  final_beta0 <- rep(NA, length(desired_p))
   
-  print(mean(Y))
+  # find best beta0 for each desired p
+  for (i in 1:length(desired_p)) {
+    final_beta0[i] <- beta0_vec[which.min(abs(ps - desired_p[i]))]
+  }
+  
+  return (final_beta0)
 }
+
+case1_beta0s <- get_beta0(0.5, 0.5)
+case2_beta0s <- get_beta0(2, 2)
+case3_beta0s <- get_beta0(2, 0)
+case4_beta0s <- get_beta0(0, 2)
+
+case1_beta0s
+case2_beta0s
+case3_beta0s
+case4_beta0s
 ```
 
 
