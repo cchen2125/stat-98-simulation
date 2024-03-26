@@ -1,0 +1,109 @@
+# Load necessary libraries
+library(caret)
+library(nnet)
+library(class)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+library(smotefamily)  # For SMOTE
+
+# Define the data generation function
+generate_data <- function(n, beta_0, beta_1, beta_2) {
+  X1 <- rnorm(n, mean = 0, sd = 2)
+  X2 <- rexp(n, rate = 0.5) - 2
+  linear_combination <- beta_0 + beta_1 * X1 + beta_2 * X2
+  prob <- exp(linear_combination) / (1 + exp(linear_combination))
+  Y <- rbinom(n, size = 1, prob = prob)
+  Y <- factor(Y, levels = c(0, 1))  # Convert Y to a factor with two levels
+  data <- data.frame(Y, X1, X2)
+  return(data)
+}
+
+
+# Define the model fitting function
+fit_model <- function(train_data, method) {
+  control <- trainControl(method = "cv", number = 5)
+  model <- NULL
+  if (method == "logistic") {
+    model <- train(Y ~ ., data = train_data, method = "glm", family = "binomial", trControl = control)
+  } else if (method == "knn") {
+    tuneGrid <- expand.grid(k = seq(5, 50, by = 5))
+    model <- train(Y ~ ., data = train_data, method = "knn", tuneGrid = tuneGrid, trControl = control)
+  } else if (method == "tree") {
+    model <- train(Y ~ ., data = train_data, method = "rpart", trControl = control)
+  } else if (method == "forest") {
+    tuneGrid <- expand.grid(mtry = c(1, 2))
+    model <- train(Y ~ ., data = train_data, method = "rf", tuneGrid = tuneGrid, trControl = control, ntree = 100)
+  }
+  
+  return(model)
+}
+
+# Define the evaluate_model function
+evaluate_model <- function(model, test_data) {
+  predictions <- predict(model, newdata = test_data, type = "raw")
+  cm <- confusionMatrix(predictions, test_data$Y)
+  evaluation <- list(
+    Accuracy = cm$overall['Accuracy'],
+    Sensitivity = cm$byClass['Sensitivity'],
+    Specificity = cm$byClass['Specificity'],
+    Precision = cm$byClass['Precision'],
+    F1 = cm$byClass['F1'],
+    AUC = as.numeric(roc(response = test_data$Y, predictor = as.numeric(predictions))$auc)
+  )
+  return(evaluation)
+  
+  # Define Beta values for the four cases as a list of lists
+beta_values <- list(
+  case1 = list(beta_1 = 0.5, beta_2 = 0.5),
+  case2 = list(beta_1 = 2, beta_2 = 2),
+  case3 = list(beta_1 = 2, beta_2 = 0),
+  case4 = list(beta_1 = 0, beta_2 = 2)
+)
+
+# Define Imbalance ratios represented by target proportions p
+p_values <- c(0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95)
+
+# Set overall sample size
+n <- 3000  
+
+  
+  # Loop over imbalance ratios
+  for(p in p_values) {
+    # Adjust beta_0 to achieve the desired class proportion p
+    beta_0 <- qlogis(p) - beta_1 * mean(rnorm(10^6, mean = 0, sd = 2)) - beta_2 * mean(rexp(10^6, rate = 0.5) - 2)
+    
+    # Generate synthetic data
+    data <- generate_data(n, beta_0, beta_1, beta_2)
+    
+    # Split data into training and testing sets
+    set.seed(123)
+    indices <- createDataPartition(data$Y, p = 0.7, list = FALSE)
+    train_data <- data[indices, ]
+    test_data <- data[-indices, ]
+    
+    # Fit models and evaluate for each model type
+    models <- c("logistic", "knn", "tree", "forest")
+    for(model_name in models) {
+      model <- fit_model(train_data, model_name)
+      evaluation <- evaluate_model(model, test_data)
+      
+      print(sprintf("Case: %s, p: %f, Model: %s", case_name, p, model_name))
+      print(evaluation)
+      
+      # Apply balancing techniques
+      for(method in c("over", "under", "smote")) {
+        balanced_data <- balance_data(train_data, method)
+        model_balanced <- fit_model(balanced_data, model_name)
+        evaluation_balanced <- evaluate_model(model_balanced, test_data)
+        
+        print(sprintf("Case: %s, p: %f, Model: %s, Balancing: %s", case_name, p, model_name, method))
+        print(evaluation_balanced)
+      }
+    }
+  }
+}
+
+# I think I'm on the right track with this? I had ChatGPT help a little as well so I'm not too sure 
+
