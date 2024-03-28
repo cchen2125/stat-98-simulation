@@ -1,0 +1,1234 @@
+---
+title: "Simulation Code"
+output: pdf_document
+date: "2024-03-06"
+---
+
+```{r message=FALSE}
+library(tidyverse)
+library(caret)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(ROSE)
+library(smotefamily)
+library(gridExtra)
+
+set.seed(0)
+```
+
+```{r}
+# set fixed variables
+n_iter <- 1000
+n <- 2000
+case1_b1 <- 0.5; case1_b2 <- 0.5
+case2_b1 <- 2; case2_b2 <- 2
+case3_b1 <- 2; case3_b2 <- 0
+case4_b1 <- 0; case4_b2 <- 2
+desired_p <- c(0.05, 0.25, 0.5, 0.75, 0.95)
+```
+
+# Mini simulation to test the p and $\beta_0$ relationship formula
+
+```{r cache=TRUE}
+# p and beta 0 relationship Monte Carlo test
+n_test <- 10^5
+
+sigmoid <- function(x) {
+  return (1 / (1+exp(-x)))
+}
+
+get_beta0 <- function(beta1, beta2) {
+  
+  # grid of beta 0 to try
+  beta0_vec <- seq(-10, 10, 0.1) 
+  
+  # placeholder p vector
+  ps <- rep(NA, length(beta0_vec))
+  
+  # get empircal proportion for each beta0
+  for (i in 1:length(beta0_vec)) {
+    X1 <- rnorm(n_test, 0, 2)
+    X2 <- rexp(n_test, 0.5) - 2
+    
+    probs <- sigmoid(beta0_vec[i] + beta1 * X1 + beta2 * X2)
+    
+    Y <- rbinom(n_test, 1, probs)
+    
+    ps[i] <- mean(Y)
+  }
+  
+  final_beta0 <- rep(NA, length(desired_p))
+  
+  # find best beta0 for each desired p
+  for (i in 1:length(desired_p)) {
+    final_beta0[i] <- beta0_vec[which.min(abs(ps - desired_p[i]))]
+  }
+  
+  return (final_beta0)
+}
+
+case1_beta0s <- get_beta0(case1_b1, case1_b2)
+case2_beta0s <- get_beta0(case2_b1, case2_b2)
+case3_beta0s <- get_beta0(case3_b1, case3_b2)
+case4_beta0s <- get_beta0(case4_b1, case4_b2)
+
+case1_beta0s
+case2_beta0s
+case3_beta0s
+case4_beta0s
+```
+
+# Data Generation
+
+```{r}
+# for generating one dataset
+generate_data <- function(n, beta_0, beta_1, beta_2) {
+  X1 <- rnorm(n, mean = 0, sd = 2)
+  X2 <- rexp(n, rate = 0.5) - 2
+  linear_combination <- beta_0 + beta_1 * X1 + beta_2 * X2
+  prob <- exp(linear_combination) / (1 + exp(linear_combination))
+  Y <- rbinom(n, size = 1, prob = prob)
+  data <- data.frame(Y, X1, X2)
+  return(data)
+}
+```
+
+
+```{r eval=FALSE}
+# generate all the datasets and save them
+for (iter in 1:1000) {
+  for (i in 1:length(desired_p)) {
+    data <- generate_data(n, case1_beta0s[i], case1_b1, case1_b2)
+    write.csv(data, file.path("data/", sprintf("data_case%s_p%s_iter%s.csv", 1, desired_p[i], iter)), 
+              row.names = FALSE)
+  }
+  
+  for (i in 1:length(desired_p)) {
+    data <- generate_data(n, case2_beta0s[i], case2_b1, case2_b2)
+    write.csv(data, file.path("data/", sprintf("data_case%s_p%s_iter%s.csv", 2, desired_p[i], iter)), 
+              row.names = FALSE)
+  }
+  
+  for (i in 1:length(desired_p)) {
+    data <- generate_data(n, case3_beta0s[i], case3_b1, case3_b2)
+    write.csv(data, file.path("data/", sprintf("data_case%s_p%s_iter%s.csv", 3, desired_p[i], iter)),
+              row.names = FALSE)
+  }
+  
+  for (i in 1:length(desired_p)) {
+    data <- generate_data(n, case4_beta0s[i], case4_b1, case4_b2)
+    write.csv(data, file.path("data/", sprintf("data_case%s_p%s_iter%s.csv", 4, desired_p[i], iter)),
+              row.names = FALSE)
+  } 
+}
+```
+
+
+# Logistic Regression
+
+## Helper Functions
+
+```{r}
+# helper function for getting the class predictions
+get_logit_preds <- function(model, data) {
+  yhat <- predict(model, new=data)
+  phat <- exp(yhat) / (1+exp(yhat))
+  preds <- round(phat)
+  return (preds)
+}
+
+# get logistic regression metrics
+get_logreg_metrics <- function(logit, train_data, test_data,true_beta1, true_beta2) {
+  # beta 1 coverage and bias
+  beta1_hat <- summary(logit)$coefficients[2, 1];beta1_se <- summary(logit)$coefficients[2, 2]
+  b1_coverage <- (true_beta1 <= beta1_hat + 1.96 * beta1_se) && 
+    (true_beta1 >= beta1_hat - 1.96 *beta1_se)
+  
+  b1_bias <- beta1_hat - true_beta1
+  
+  # beta 2 coverage and bias
+  beta2_hat <- summary(logit)$coefficients[3, 1]; beta2_se <- summary(logit)$coefficients[3,2]
+  b2_coverage <- (true_beta2 <= beta2_hat + 1.96*beta2_se) && (true_beta2 >= beta2_hat - beta2_se)
+  
+  b2_bias <- beta2_hat - true_beta2
+  
+  # accuracy
+  train_logit_preds <- get_logit_preds(logit, train_data)
+  train_acc <- mean(train_logit_preds == train_data$Y)
+  
+  test_logit_preds <- get_logit_preds(logit, test_data)
+  test_acc <- mean(test_logit_preds == test_data$Y)
+  
+  # train sensitivity, specificity
+  logit_cm_train <- confusionMatrix(factor(train_logit_preds, level=c(0,1)), 
+                                    factor(train_data$Y, level=c(0,1)))
+  train_sensitivity <- logit_cm_train$byClass["Sensitivity"]
+  train_specificity <- logit_cm_train$byClass["Specificity"]
+  
+  # test sensitivity, specificity
+  logit_cm_test <- confusionMatrix(factor(test_logit_preds, level=c(0,1)), 
+                                   factor(test_data$Y, level=c(0,1)))
+  test_sensitivity <- logit_cm_test$byClass["Sensitivity"]
+  test_specificity <- logit_cm_test$byClass["Specificity"]
+
+  return (data.frame(b1_coverage=b1_coverage, b2_coverage=b2_coverage, 
+                    b1_bias=b1_bias, b2_bias=b2_bias, 
+                    train_acc=train_acc, test_acc=test_acc,
+                    train_sensitivity=train_sensitivity, test_sensitivity=test_sensitivity,
+                    train_specificity=train_specificity, test_specficity=test_specificity
+                    ))
+}
+
+# returns a dataframe with logistic regression results for one dataset case
+get_logit_results <- function(case, p, true_beta1, true_beta2, resampling="none") {
+    print(p)
+    
+    logit_results <- data.frame()
+
+    for (iter in 1:n_iter) {
+      data <- read_csv(sprintf("data/data_case%s_p%s_iter%s.csv", case, p, iter), show_col_types = FALSE)
+      
+      # stratified train test split
+      train_idx <- createDataPartition(data$Y, p=0.7, list=FALSE)
+      train_data <- data[train_idx,]
+      test_data <- data[-train_idx,]
+      
+      if (resampling == "over") {
+        train_data <- ovun.sample(Y~X1+X2, data = get("train_data", sys.frame(1)), method = "over", 
+                                  N = 2 * max(table(get("train_data", sys.frame(1))$Y)), seed=0
+                                  )$data
+      }
+      if (resampling == "under") {
+        train_data <- ovun.sample(Y~X1+X2, data = get("train_data", sys.frame(1)), method = "under", 
+                                   N = 2 * min(table(get("train_data", sys.frame(1))$Y)), seed=0
+                                   )$data
+      }
+      if ((resampling == "smote") && (p != 0.5)) {
+        train_data <- SMOTE(train_data[c("X1", "X2")], train_data$Y, dup_size=0)$data
+        train_data$Y <- as.integer(train_data$class)
+      }
+      
+      #print(nrow(train_data))
+      
+      logit <- glm(Y~X1 + X2, data=train_data, family="binomial")
+      
+      logit_results <- rbind(logit_results, 
+                             get_logreg_metrics(logit, 
+                                                train_data, test_data,
+                                                true_beta1, true_beta2))
+    }
+
+    return(logit_results)
+}
+```
+
+
+## Fitting model on raw data
+
+```{r}
+logit_case1_raw <- list(p0.05=get_logit_results(case=1, p=0.05, case1_b1, case1_b2),
+                        p0.25=get_logit_results(case=1, p=0.25, case1_b1, case1_b2),
+                        p0.5=get_logit_results(case=1, p=0.5, case1_b1, case1_b2),
+                        p0.75=get_logit_results(case=1, p=0.75, case1_b1, case1_b2),
+                        p0.95=get_logit_results(case=1, p=0.95, case1_b1, case1_b2))
+
+logit_case2_raw <- list(p0.05=get_logit_results(case=2, p=0.05, case2_b1, case2_b2),
+                        p0.25=get_logit_results(case=2, p=0.25, case2_b1, case2_b2),
+                        p0.5=get_logit_results(case=2, p=0.5, case2_b1, case2_b2),
+                        p0.75=get_logit_results(case=2, p=0.75, case2_b1, case2_b2),
+                        p0.95=get_logit_results(case=2, p=0.95, case2_b1, case2_b2))
+
+logit_case3_raw <- list(p0.05=get_logit_results(case=3, p=0.05, case3_b1, case3_b2),
+                        p0.25=get_logit_results(case=3, p=0.25, case3_b1, case3_b2),
+                        p0.5=get_logit_results(case=3, p=0.5, case3_b1, case3_b2),
+                        p0.75=get_logit_results(case=3, p=0.75, case3_b1, case3_b2),
+                        p0.95=get_logit_results(case=3, p=0.95, case3_b1, case3_b2))
+
+logit_case4_raw <- list(p0.05=get_logit_results(case=4, p=0.05, case4_b1, case4_b2),
+                        p0.25=get_logit_results(case=4, p=0.25, case4_b1, case4_b2),
+                        p0.5=get_logit_results(case=4, p=0.5, case4_b1, case4_b2),
+                        p0.75=get_logit_results(case=4, p=0.75, case4_b1, case4_b2),
+                        p0.95=get_logit_results(case=4, p=0.95, case4_b1, case4_b2))
+```
+
+```{r}
+saveRDS(logit_case1_raw, file="logit_case1_raw.RDS")
+saveRDS(logit_case2_raw, file="logit_case2_raw.RDS")
+saveRDS(logit_case3_raw, file="logit_case3_raw.RDS")
+saveRDS(logit_case4_raw, file="logit_case4_raw.RDS")
+```
+
+## Fitting model on oversampled data
+
+```{r}
+logit_case1_over <- list(p0.05=get_logit_results(case=1, p=0.05, case1_b1, case1_b2, "over"),
+                        p0.25=get_logit_results(case=1, p=0.25, case1_b1, case1_b2, "over"),
+                        p0.5=get_logit_results(case=1, p=0.5, case1_b1, case1_b2, "over"),
+                        p0.75=get_logit_results(case=1, p=0.75, case1_b1, case1_b2, "over"),
+                        p0.95=get_logit_results(case=1, p=0.95, case1_b1, case1_b2, "over"))
+
+logit_case2_over <- list(p0.05=get_logit_results(case=2, p=0.05, case2_b1, case2_b2, "over"),
+                        p0.25=get_logit_results(case=2, p=0.25, case2_b1, case2_b2, "over"),
+                        p0.5=get_logit_results(case=2, p=0.5, case2_b1, case2_b2, "over"),
+                        p0.75=get_logit_results(case=2, p=0.75, case2_b1, case2_b2, "over"),
+                        p0.95=get_logit_results(case=2, p=0.95, case2_b1, case2_b2, "over"))
+
+logit_case3_over <- list(p0.05=get_logit_results(case=3, p=0.05, case3_b1, case3_b2, "over"),
+                        p0.25=get_logit_results(case=3, p=0.25, case3_b1, case3_b2, "over"),
+                        p0.5=get_logit_results(case=3, p=0.5, case3_b1, case3_b2, "over"),
+                        p0.75=get_logit_results(case=3, p=0.75, case3_b1, case3_b2, "over"),
+                        p0.95=get_logit_results(case=3, p=0.95, case3_b1, case3_b2, "over"))
+
+logit_case4_over <- list(p0.05=get_logit_results(case=4, p=0.05, case4_b1, case4_b2, "over"),
+                        p0.25=get_logit_results(case=4, p=0.25, case4_b1, case4_b2, "over"),
+                        p0.5=get_logit_results(case=4, p=0.5, case4_b1, case4_b2, "over"),
+                        p0.75=get_logit_results(case=4, p=0.75, case4_b1, case4_b2, "over"),
+                        p0.95=get_logit_results(case=4, p=0.95, case4_b1, case4_b2, "over"))
+```
+
+```{r}
+saveRDS(logit_case1_over, file="logit_case1_over.RDS")
+saveRDS(logit_case2_over, file="logit_case2_over.RDS")
+saveRDS(logit_case3_over, file="logit_case3_over.RDS")
+saveRDS(logit_case4_over, file="logit_case4_over.RDS")
+```
+
+
+## Fitting model on undersampled data
+
+```{r}
+logit_case1_under <- list(p0.05=get_logit_results(case=1, p=0.05, case1_b1, case1_b2, "under"),
+                        p0.25=get_logit_results(case=1, p=0.25, case1_b1, case1_b2, "under"),
+                        p0.5=get_logit_results(case=1, p=0.5, case1_b1, case1_b2, "under"),
+                        p0.75=get_logit_results(case=1, p=0.75, case1_b1, case1_b2, "under"),
+                        p0.95=get_logit_results(case=1, p=0.95, case1_b1, case1_b2, "under"))
+
+logit_case2_under <- list(p0.05=get_logit_results(case=2, p=0.05, case2_b1, case2_b2, "under"),
+                        p0.25=get_logit_results(case=2, p=0.25, case2_b1, case2_b2, "under"),
+                        p0.5=get_logit_results(case=2, p=0.5, case2_b1, case2_b2, "under"),
+                        p0.75=get_logit_results(case=2, p=0.75, case2_b1, case2_b2, "under"),
+                        p0.95=get_logit_results(case=2, p=0.95, case2_b1, case2_b2, "under"))
+
+logit_case3_under <- list(p0.05=get_logit_results(case=3, p=0.05, case3_b1, case3_b2, "under"),
+                        p0.25=get_logit_results(case=3, p=0.25, case3_b1, case3_b2, "under"),
+                        p0.5=get_logit_results(case=3, p=0.5, case3_b1, case3_b2, "under"),
+                        p0.75=get_logit_results(case=3, p=0.75, case3_b1, case3_b2, "under"),
+                        p0.95=get_logit_results(case=3, p=0.95, case3_b1, case3_b2, "under"))
+
+logit_case4_under <- list(p0.05=get_logit_results(case=4, p=0.05, case4_b1, case4_b2, "under"),
+                        p0.25=get_logit_results(case=4, p=0.25, case4_b1, case4_b2, "under"),
+                        p0.5=get_logit_results(case=4, p=0.5, case4_b1, case4_b2, "under"),
+                        p0.75=get_logit_results(case=4, p=0.75, case4_b1, case4_b2, "under"),
+                        p0.95=get_logit_results(case=4, p=0.95, case4_b1, case4_b2, "under"))
+```
+
+```{r}
+saveRDS(logit_case1_under, file="logit_case1_under.RDS")
+saveRDS(logit_case2_under, file="logit_case2_under.RDS")
+saveRDS(logit_case3_under, file="logit_case3_under.RDS")
+saveRDS(logit_case4_under, file="logit_case4_under.RDS")
+```
+
+## Fitting model on SMOTE data
+
+```{r}
+logit_case1_smote <- list(p0.05=get_logit_results(case=1, p=0.05, case1_b1, case1_b2, "smote"),
+                        p0.25=get_logit_results(case=1, p=0.25, case1_b1, case1_b2, "smote"),
+                        p0.5=get_logit_results(case=1, p=0.5, case1_b1, case1_b2, "smote"),
+                        p0.75=get_logit_results(case=1, p=0.75, case1_b1, case1_b2, "smote"),
+                        p0.95=get_logit_results(case=1, p=0.95, case1_b1, case1_b2, "smote"))
+
+logit_case2_smote <- list(p0.05=get_logit_results(case=2, p=0.05, case2_b1, case2_b2, "smote"),
+                        p0.25=get_logit_results(case=2, p=0.25, case2_b1, case2_b2, "smote"),
+                        p0.5=get_logit_results(case=2, p=0.5, case2_b1, case2_b2, "smote"),
+                        p0.75=get_logit_results(case=2, p=0.75, case2_b1, case2_b2, "smote"),
+                        p0.95=get_logit_results(case=2, p=0.95, case2_b1, case2_b2, "smote"))
+
+logit_case3_smote <- list(p0.05=get_logit_results(case=3, p=0.05, case3_b1, case3_b2, "smote"),
+                        p0.25=get_logit_results(case=3, p=0.25, case3_b1, case3_b2, "smote"),
+                        p0.5=get_logit_results(case=3, p=0.5, case3_b1, case3_b2, "smote"),
+                        p0.75=get_logit_results(case=3, p=0.75, case3_b1, case3_b2, "smote"),
+                        p0.95=get_logit_results(case=3, p=0.95, case3_b1, case3_b2, "smote"))
+
+logit_case4_smote <- list(p0.05=get_logit_results(case=4, p=0.05, case4_b1, case4_b2, "smote"),
+                        p0.25=get_logit_results(case=4, p=0.25, case4_b1, case4_b2, "smote"),
+                        p0.5=get_logit_results(case=4, p=0.5, case4_b1, case4_b2, "smote"),
+                        p0.75=get_logit_results(case=4, p=0.75, case4_b1, case4_b2, "smote"),
+                        p0.95=get_logit_results(case=4, p=0.95, case4_b1, case4_b2, "smote"))
+```
+
+```{r}
+saveRDS(logit_case1_smote, file="logit_case1_smote.RDS")
+saveRDS(logit_case2_smote, file="logit_case2_smote.RDS")
+saveRDS(logit_case3_smote, file="logit_case3_smote.RDS")
+saveRDS(logit_case4_smote, file="logit_case4_smote.RDS")
+```
+
+# Decision Tree Model
+
+## Helper functions
+
+```{r}
+# getting metrics for the nonparametric models
+get_nonparam_metrics <- function(model, train_data, test_data) {
+  # accuracy
+  train_preds <- predict(model, newdata = train_data, type="class")
+  train_acc <- mean(train_preds == train_data$Y)
+  
+  test_preds <- predict(model, newdata = test_data, type="class")
+  test_acc <- mean(test_preds == test_data$Y)
+  
+  # train sensitivity, specificity
+  cm_train <- confusionMatrix(factor(train_preds, level=c(0,1)), 
+                                  factor(train_data$Y, level=c(0,1)))
+  train_sensitivity <- cm_train$byClass["Sensitivity"]
+  train_specificity <- cm_train$byClass["Specificity"]
+  
+  # test sensitivity, specificity
+  cm_test <- confusionMatrix(factor(test_preds, level=c(0,1)), 
+                                  factor(test_data$Y, level=c(0,1)))
+  test_sensitivity <- cm_test$byClass["Sensitivity"]
+  test_specificity <- cm_test$byClass["Specificity"]
+  
+  return(data.frame(train_acc=train_acc, test_acc=test_acc,
+              train_sensitivity=train_sensitivity, test_sensitivity=test_sensitivity,
+              train_specificity=train_specificity, test_specficity=test_specificity))
+}
+```
+
+```{r}
+# getting decision tree results for one data generation case
+get_tree_results <- function(case, p, resampling="none") {
+  data <- read_csv(sprintf("data/data_case%s_p%s_iter%s.csv", case, p, 1), show_col_types = FALSE)
+        
+  # stratified train test split
+  train_idx <- createDataPartition(data$Y, p=0.7, list=FALSE)
+  train_data <- data[train_idx,]
+  test_data <- data[-train_idx,]
+  
+  # cross validate
+  cvIndex <- createFolds(factor(train_data$Y), 3, returnTrain=T)
+  train_control <- trainControl(index=cvIndex,
+                              method="cv",
+                              number=3)
+    
+  validatedTree <- train(factor(Y)~X1+X2,
+              data=train_data,
+              method="rpart",
+              trControl=train_control,
+              tuneLength=10)
+  
+  tree_results <- data.frame()
+  
+  for (iter in 1:n_iter) { 
+    
+    data <- read_csv(sprintf("data/data_case%s_p%s_iter%s.csv", case, p, iter), show_col_types = FALSE)
+        
+    # stratified train test split
+    train_idx <- createDataPartition(data$Y, p=0.7, list=FALSE)
+    train_data <- data[train_idx,]
+    test_data <- data[-train_idx,]
+  
+    
+    # resampling
+    if ((resampling == "over") && (mean(train_data$Y) != 0.5)) {
+      train_data <- ovun.sample(Y~X1+X2, data = get("train_data", sys.frame(1)), method = "over", 
+                                N = 2 * max(table(get("train_data", sys.frame(1))$Y)), seed=0
+                                )$data
+    }
+    if ((resampling == "under") && (mean(train_data$Y) != 0.5)) {
+      train_data <- ovun.sample(Y~X1+X2, data = get("train_data", sys.frame(1)), method = "under", 
+                                 N = 2 * min(table(get("train_data", sys.frame(1))$Y)), seed=0
+                                 )$data
+    }
+    if ((resampling == "smote") && (p != 0.5)) {
+      train_data <- SMOTE(train_data[c("X1", "X2")], train_data$Y, dup_size=0)$data
+      train_data$Y <- as.integer(train_data$class)
+    }  
+  
+    
+    # fit model
+    finalTree <- rpart(factor(Y)~X1+X2, data=train_data, control=list(cp=validatedTree$bestTune$cp))
+    
+    tree_results <- rbind(tree_results, get_nonparam_metrics(finalTree, train_data, test_data))
+  }
+  return(tree_results)
+}
+```
+
+
+## Fitting on raw data
+
+```{r}
+tree_case1_raw <- list(p0.05=get_tree_results(case=1, p=0.05),
+                        p0.25=get_tree_results(case=1, p=0.25),
+                        p0.5=get_tree_results(case=1, p=0.5),
+                        p0.75=get_tree_results(case=1, p=0.75),
+                        p0.95=get_tree_results(case=1, p=0.95))
+
+saveRDS(tree_case1_raw, file="tree_case1_raw.RDS")
+
+tree_case2_raw <- list(p0.05=get_tree_results(case=2, p=0.05),
+                        p0.25=get_tree_results(case=2, p=0.25),
+                        p0.5=get_tree_results(case=2, p=0.5),
+                        p0.75=get_tree_results(case=2, p=0.75),
+                        p0.95=get_tree_results(case=2, p=0.95))
+
+saveRDS(tree_case2_raw, file="tree_case2_raw.RDS")
+
+tree_case3_raw <- list(p0.05=get_tree_results(case=3, p=0.05),
+                        p0.25=get_tree_results(case=3, p=0.25),
+                        p0.5=get_tree_results(case=3, p=0.5),
+                        p0.75=get_tree_results(case=3, p=0.75),
+                        p0.95=get_tree_results(case=3, p=0.95))
+
+saveRDS(tree_case3_raw, file="tree_case3_raw.RDS")
+
+tree_case4_raw <- list(p0.05=get_tree_results(case=4, p=0.05),
+                        p0.25=get_tree_results(case=4, p=0.25),
+                        p0.5=get_tree_results(case=4, p=0.5),
+                        p0.75=get_tree_results(case=4, p=0.75),
+                        p0.95=get_tree_results(case=4, p=0.95))
+
+saveRDS(tree_case4_raw, file="tree_case4_raw.RDS")
+```
+
+
+## Fitting on oversampled data
+
+```{r}
+tree_case1_over <- list(p0.05=get_tree_results(case=1, p=0.05, "over"),
+                        p0.25=get_tree_results(case=1, p=0.25, "over"),
+                        p0.5=get_tree_results(case=1, p=0.5, "over"),
+                        p0.75=get_tree_results(case=1, p=0.75, "over"),
+                        p0.95=get_tree_results(case=1, p=0.95, "over"))
+
+saveRDS(tree_case1_over, file="tree_case1_over.RDS")
+
+tree_case2_over <- list(p0.05=get_tree_results(case=2, p=0.05, "over"),
+                        p0.25=get_tree_results(case=2, p=0.25, "over"),
+                        p0.5=get_tree_results(case=2, p=0.5, "over"),
+                        p0.75=get_tree_results(case=2, p=0.75, "over"),
+                        p0.95=get_tree_results(case=2, p=0.95, "over"))
+
+saveRDS(tree_case2_over, file="tree_case2_over.RDS")
+
+tree_case3_over <- list(p0.05=get_tree_results(case=3, p=0.05, "over"),
+                        p0.25=get_tree_results(case=3, p=0.25, "over"),
+                        p0.5=get_tree_results(case=3, p=0.5, "over"),
+                        p0.75=get_tree_results(case=3, p=0.75, "over"),
+                        p0.95=get_tree_results(case=3, p=0.95, "over"))
+
+saveRDS(tree_case3_over, file="tree_case3_over.RDS")
+
+tree_case4_over <- list(p0.05=get_tree_results(case=4, p=0.05, "over"),
+                        p0.25=get_tree_results(case=4, p=0.25, "over"),
+                        p0.5=get_tree_results(case=4, p=0.5, "over"),
+                        p0.75=get_tree_results(case=4, p=0.75, "over"),
+                        p0.95=get_tree_results(case=4, p=0.95, "over"))
+
+saveRDS(tree_case4_over, file="tree_case4_over.RDS")
+```
+
+
+## Fitting on undersampled data
+
+```{r}
+tree_case1_under <- list(p0.05=get_tree_results(case=1, p=0.05, "under"),
+                        p0.25=get_tree_results(case=1, p=0.25, "under"),
+                        p0.5=get_tree_results(case=1, p=0.5, "under"),
+                        p0.75=get_tree_results(case=1, p=0.75, "under"),
+                        p0.95=get_tree_results(case=1, p=0.95, "under"))
+
+saveRDS(tree_case1_under, file="tree_case1_under.RDS")
+
+tree_case2_under <- list(p0.05=get_tree_results(case=2, p=0.05, "under"),
+                        p0.25=get_tree_results(case=2, p=0.25, "under"),
+                        p0.5=get_tree_results(case=2, p=0.5, "under"),
+                        p0.75=get_tree_results(case=2, p=0.75, "under"),
+                        p0.95=get_tree_results(case=2, p=0.95, "under"))
+
+saveRDS(tree_case2_under, file="tree_case2_under.RDS")
+
+tree_case3_under <- list(p0.05=get_tree_results(case=3, p=0.05, "under"),
+                        p0.25=get_tree_results(case=3, p=0.25, "under"),
+                        p0.5=get_tree_results(case=3, p=0.5, "under"),
+                        p0.75=get_tree_results(case=3, p=0.75, "under"),
+                        p0.95=get_tree_results(case=3, p=0.95, "under"))
+
+saveRDS(tree_case3_under, file="tree_case3_under.RDS")
+
+tree_case4_under <- list(p0.05=get_tree_results(case=4, p=0.05, "under"),
+                        p0.25=get_tree_results(case=4, p=0.25, "under"),
+                        p0.5=get_tree_results(case=4, p=0.5, "under"),
+                        p0.75=get_tree_results(case=4, p=0.75, "under"),
+                        p0.95=get_tree_results(case=4, p=0.95, "under"))
+
+saveRDS(tree_case4_under, file="tree_case4_under.RDS")
+```
+
+
+## Fitting on smote data
+
+```{r}
+tree_case1_smote <- list(p0.05=get_tree_results(case=1, p=0.05, "smote"),
+                        p0.25=get_tree_results(case=1, p=0.25, "smote"),
+                        p0.5=get_tree_results(case=1, p=0.5, "smote"),
+                        p0.75=get_tree_results(case=1, p=0.75, "smote"),
+                        p0.95=get_tree_results(case=1, p=0.95, "smote"))
+
+saveRDS(tree_case1_smote, file="tree_case1_smote.RDS")
+
+tree_case2_smote <- list(p0.05=get_tree_results(case=2, p=0.05, "smote"),
+                        p0.25=get_tree_results(case=2, p=0.25, "smote"),
+                        p0.5=get_tree_results(case=2, p=0.5, "smote"),
+                        p0.75=get_tree_results(case=2, p=0.75, "smote"),
+                        p0.95=get_tree_results(case=2, p=0.95, "smote"))
+
+saveRDS(tree_case2_smote, file="tree_case2_smote.RDS")
+
+tree_case3_smote <- list(p0.05=get_tree_results(case=3, p=0.05, "smote"),
+                        p0.25=get_tree_results(case=3, p=0.25, "smote"),
+                        p0.5=get_tree_results(case=3, p=0.5, "smote"),
+                        p0.75=get_tree_results(case=3, p=0.75, "smote"),
+                        p0.95=get_tree_results(case=3, p=0.95, "smote"))
+
+saveRDS(tree_case3_smote, file="tree_case3_smote.RDS")
+
+tree_case4_smote <- list(p0.05=get_tree_results(case=4, p=0.05, "smote"),
+                        p0.25=get_tree_results(case=4, p=0.25, "smote"),
+                        p0.5=get_tree_results(case=4, p=0.5, "smote"),
+                        p0.75=get_tree_results(case=4, p=0.75, "smote"),
+                        p0.95=get_tree_results(case=4, p=0.95, "smote"))
+
+saveRDS(tree_case4_smote, file="tree_case4_smote.RDS")
+```
+
+# First look at the results (basic visuals to see what's interesting)
+
+## CI coverage 
+
+```{r}
+# looks at coverage probability across betas for one set of true beta 1 beta 2
+coverage_prob_plot <- function(df, title) {
+  coverage_results <- data.frame(approx_p=desired_p,
+  b1_coverage=c(mean(df$p0.05$b1_coverage),
+            mean(df$p0.25$b1_coverage),
+            mean(df$p0.5$b1_coverage),
+            mean(df$p0.75$b1_coverage),
+            mean(df$p0.95$b1_coverage)),
+  b2_coverage=c(mean(df$p0.05$b2_coverage),
+mean(df$p0.25$b2_coverage),
+mean(df$p0.5$b2_coverage),
+mean(df$p0.75$b2_coverage),
+mean(df$p0.95$b2_coverage)))
+
+plot <- ggplot(coverage_results, aes(x=approx_p)) +
+  geom_hline(yintercept=0.95)+
+  geom_point(aes(y=b1_coverage, color="beta 1"))+
+  geom_line(aes(y=b1_coverage,color="beta 1"))+
+  geom_point(aes(y=b2_coverage,color="beta 2")) +
+  geom_line(aes(y=b2_coverage,color="beta 2")) +
+  labs(x="Approximate p", y="Coverage Probability", title=title, color="Beta") +
+  theme_bw()
+
+return(plot)
+}
+
+coverage_prob_plot(logit_case1_raw, "Beta Coverage Probabilities for Case 1")
+coverage_prob_plot(logit_case2_raw, "Beta Coverage Probabilities for Case 2")
+coverage_prob_plot(logit_case3_raw, "Beta Coverage Probabilities for Case 3")
+coverage_prob_plot(logit_case4_raw, "Beta Coverage Probabilities for Case 4")
+```
+
+```{r}
+coverage_prob_plot(logit_case1_over, "Beta Coverage Probabilities for Case 1 Oversampled")
+coverage_prob_plot(logit_case2_over, "Beta Coverage Probabilities for Case 2 Oversampled")
+coverage_prob_plot(logit_case3_over, "Beta Coverage Probabilities for Case 3 Oversampled")
+coverage_prob_plot(logit_case4_over, "Beta Coverage Probabilities for Case 4 Oversampled")
+```
+```{r}
+coverage_prob_plot(logit_case1_under, "Beta Coverage Probabilities for Case 1 Undersampled")
+coverage_prob_plot(logit_case2_under, "Beta Coverage Probabilities for Case 2 Undersampled")
+coverage_prob_plot(logit_case3_under, "Beta Coverage Probabilities for Case 3 Undersampled")
+coverage_prob_plot(logit_case4_under, "Beta Coverage Probabilities for Case 4 Undersampled")
+```
+
+```{r}
+coverage_prob_plot(logit_case1_smote, "Beta Coverage Probabilities for Case 1 SMOTE")
+coverage_prob_plot(logit_case2_smote, "Beta Coverage Probabilities for Case 2 SMOTE")
+coverage_prob_plot(logit_case3_smote, "Beta Coverage Probabilities for Case 3 SMOTE")
+coverage_prob_plot(logit_case4_smote, "Beta Coverage Probabilities for Case 4 SMOTE")
+```
+## Bias
+
+```{r}
+# plots bias across beta values for one case of beta1, beta2 coefficients
+bias_plot <- function(df, title) {
+  bias_results <- data.frame(approx_p=desired_p,
+  b1_bias=c(mean(df$p0.05$b1_bias),
+            mean(df$p0.25$b1_bias),
+            mean(df$p0.5$b1_bias),
+            mean(df$p0.75$b1_bias),
+            mean(df$p0.95$b1_bias)),
+  b2_bias=c(mean(df$p0.05$b2_bias),
+mean(df$p0.25$b2_bias),
+mean(df$p0.5$b2_bias),
+mean(df$p0.75$b2_bias),
+mean(df$p0.95$b2_bias)))
+
+plot <- ggplot(bias_results, aes(x=approx_p)) +
+  geom_hline(yintercept=0) +
+  geom_point(aes(y=b1_bias, color="beta 1"))+
+  geom_line(aes(y=b1_bias,color="beta 1"))+
+  geom_point(aes(y=b2_bias,color="beta 2")) +
+  geom_line(aes(y=b2_bias,color="beta 2")) +
+  labs(x="Approximate p", y="Bias", title=title, color="Beta") +
+  theme_bw()
+
+return(plot)
+}
+```
+
+```{r}
+bias_plot(logit_case1_raw, "Beta Bias for Case 1")
+bias_plot(logit_case2_raw, "Beta Bias for Case 2")
+bias_plot(logit_case3_raw, "Beta Bias for Case 3")
+bias_plot(logit_case4_raw, "Beta Bias for Case 4")
+```
+
+
+```{r}
+bias_plot(logit_case1_over, "Beta Bias for Case 1 Oversampled")
+bias_plot(logit_case2_over, "Beta Bias for Case 2 Oversampled")
+bias_plot(logit_case3_over, "Beta Bias for Case 3 Oversampled")
+bias_plot(logit_case4_over, "Beta Bias for Case 4 Oversampled")
+```
+```{r}
+bias_plot(logit_case1_under, "Beta Bias for Case 1 Undersampled")
+bias_plot(logit_case2_under, "Beta Bias for Case 2 Undersampled")
+bias_plot(logit_case3_under, "Beta Bias for Case 3 Undersampled")
+bias_plot(logit_case4_under, "Beta Bias for Case 4 Undersampled")
+```
+
+```{r}
+bias_plot(logit_case1_smote, "Beta Bias for Case 1 SMOTE")
+bias_plot(logit_case2_smote, "Beta Bias for Case 2 SMOTE")
+bias_plot(logit_case3_smote, "Beta Bias for Case 3 SMOTE")
+bias_plot(logit_case4_smote, "Beta Bias for Case 4 SMOTE")
+```
+
+## Accuracy
+
+```{r}
+# plots accuracy of logistic vs tree for one case of beta1, beta2 across class imbalance levels
+plot_acc <- function(logit_df, tree_df) {
+ acc_df <- rbind(data.frame(acc=mean(logit_df$p0.05$test_acc, na.rm=TRUE), p=0.05, type="logit", 
+           lower=quantile(logit_df$p0.05$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(logit_df$p0.05$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(logit_df$p0.25$test_acc, na.rm=TRUE), p=0.25, type="logit", 
+           lower=quantile(logit_df$p0.25$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(logit_df$p0.25$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(logit_df$p0.5$test_acc, na.rm=TRUE), p=0.5, type="logit", 
+           lower=quantile(logit_df$p0.5$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(logit_df$p0.5$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(logit_df$p0.75$test_acc, na.rm=TRUE), p=0.75, type="logit", 
+           lower=quantile(logit_df$p0.75$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(logit_df$p0.75$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(logit_df$p0.95$test_acc, na.rm=TRUE), p=0.95, type="logit", 
+           lower=quantile(logit_df$p0.95$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(logit_df$p0.95$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(tree_df$p0.05$test_acc, na.rm=TRUE), p=0.05, type="Decision Tree", 
+           lower=quantile(tree_df$p0.05$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(tree_df$p0.05$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(tree_df$p0.25$test_acc, na.rm=TRUE), p=0.25, type="Decision Tree", 
+           lower=quantile(tree_df$p0.25$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(tree_df$p0.25$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(tree_df$p0.5$test_acc, na.rm=TRUE), p=0.5, type="Decision Tree", 
+           lower=quantile(tree_df$p0.5$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(tree_df$p0.5$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(tree_df$p0.75$test_acc, na.rm=TRUE), p=0.75, type="Decision Tree", 
+           lower=quantile(tree_df$p0.75$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(tree_df$p0.75$test_acc, 0.95, na.rm=TRUE)),
+data.frame(acc=mean(tree_df$p0.95$test_acc, na.rm=TRUE), p=0.95, type="Decision Tree", 
+           lower=quantile(tree_df$p0.95$test_acc, 0.05, na.rm=TRUE), 
+           upper=quantile(tree_df$p0.95$test_acc, 0.95, na.rm=TRUE))
+) 
+ 
+ return(ggplot(acc_df, aes(x=p, y=acc, color=type)) +
+    geom_line() +
+    geom_point() + 
+    geom_errorbar(aes(ymin=lower, ymax=upper), width=0.05)+theme_bw())
+}
+```
+
+
+```{r}
+plot_acc(logit_case1_raw, tree_case1_raw)
+plot_acc(logit_case2_raw, tree_case2_raw)
+plot_acc(logit_case3_raw, tree_case3_raw)
+plot_acc(logit_case4_raw, tree_case4_raw)
+
+plot_acc(logit_case1_under, tree_case1_under)
+plot_acc(logit_case2_under, tree_case2_under)
+plot_acc(logit_case3_under, tree_case3_under)
+plot_acc(logit_case4_under, tree_case4_under)
+
+plot_acc(logit_case1_over, tree_case1_over)
+plot_acc(logit_case2_over, tree_case2_over)
+plot_acc(logit_case3_over, tree_case3_over)
+plot_acc(logit_case4_over, tree_case4_over)
+
+plot_acc(logit_case1_smote, tree_case1_smote)
+plot_acc(logit_case2_smote, tree_case2_smote)
+plot_acc(logit_case3_smote, tree_case3_smote)
+plot_acc(logit_case4_smote, tree_case4_smote)
+```
+
+## Sensitivity / Specificity
+
+```{r}
+# plots sensitivity/specificity of one model for one case of beta1, beta2 across class imbalance levels
+plot_alt_metrics <- function(df) {
+ plot_df <- rbind(data.frame(stat=mean(df$p0.05$test_sensitivity, na.rm=TRUE), p=0.05,
+           lower=quantile(df$p0.05$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.05$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity"),
+data.frame(stat=mean(df$p0.25$test_sensitivity, na.rm=TRUE), p=0.25,
+           lower=quantile(df$p0.25$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.25$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity"),
+data.frame(stat=mean(df$p0.5$test_sensitivity, na.rm=TRUE), p=0.5, 
+           lower=quantile(df$p0.5$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.5$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity"),
+data.frame(stat=mean(df$p0.75$test_sensitivity, na.rm=TRUE), p=0.75,
+           lower=quantile(df$p0.75$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.75$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity"),
+data.frame(stat=mean(df$p0.95$test_sensitivity, na.rm=TRUE), p=0.95,  
+           lower=quantile(df$p0.95$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.95$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity"),
+
+data.frame(stat=mean(df$p0.05$test_specficity, na.rm=TRUE), p=0.05, 
+           lower=quantile(df$p0.05$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.05$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity"),
+data.frame(stat=mean(df$p0.25$test_specficity, na.rm=TRUE), p=0.25, 
+           lower=quantile(df$p0.25$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.25$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity"),
+data.frame(stat=mean(df$p0.5$test_specficity, na.rm=TRUE), p=0.5,
+           lower=quantile(df$p0.5$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.5$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity"),
+data.frame(stat=mean(df$p0.75$test_specficity, na.rm=TRUE), p=0.75,
+           lower=quantile(df$p0.75$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.75$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity"),
+data.frame(stat=mean(df$p0.95$test_specficity, na.rm=TRUE), p=0.95,
+           lower=quantile(df$p0.95$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.95$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity")
+) 
+ 
+ ggplot(plot_df, aes(y=stat, x=p, color=metric)) +
+   geom_point()+
+   geom_line() +
+   geom_errorbar(aes(ymin=lower, ymax=upper), width=0.02)+theme_bw()
+}
+```
+
+```{r}
+plot_alt_metrics(logit_case1_raw)
+plot_alt_metrics(logit_case2_raw)
+plot_alt_metrics(logit_case3_raw)
+plot_alt_metrics(logit_case4_raw)
+
+plot_alt_metrics(logit_case1_over)
+plot_alt_metrics(logit_case2_over)
+plot_alt_metrics(logit_case3_over)
+plot_alt_metrics(logit_case4_over)
+
+plot_alt_metrics(logit_case1_under)
+plot_alt_metrics(logit_case2_under)
+plot_alt_metrics(logit_case3_under)
+plot_alt_metrics(logit_case4_under)
+
+plot_alt_metrics(logit_case1_smote)
+plot_alt_metrics(logit_case2_smote)
+plot_alt_metrics(logit_case3_smote)
+plot_alt_metrics(logit_case4_smote)
+```
+
+```{r}
+plot_alt_metrics(tree_case1_raw)
+plot_alt_metrics(tree_case2_raw)
+plot_alt_metrics(tree_case3_raw)
+plot_alt_metrics(tree_case4_raw)
+
+plot_alt_metrics(tree_case1_over)
+plot_alt_metrics(tree_case2_over)
+plot_alt_metrics(tree_case3_over)
+plot_alt_metrics(tree_case4_over)
+
+plot_alt_metrics(tree_case1_under)
+plot_alt_metrics(tree_case2_under)
+plot_alt_metrics(tree_case3_under)
+plot_alt_metrics(tree_case4_under)
+
+plot_alt_metrics(tree_case1_smote)
+plot_alt_metrics(tree_case2_smote)
+plot_alt_metrics(tree_case3_smote)
+plot_alt_metrics(tree_case4_smote)
+```
+
+# Final Visuals
+
+## CI Coverage Probability
+
+```{r}
+# function for summarizing coverage results
+coverage_df <- rbind(data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_raw$p0.05$b1_coverage),
+            mean(logit_case1_raw$p0.25$b1_coverage),
+            mean(logit_case1_raw$p0.5$b1_coverage),
+            mean(logit_case1_raw$p0.75$b1_coverage),
+            mean(logit_case1_raw$p0.95$b1_coverage)),
+           method=rep("None", 5),
+           beta=rep("beta[1]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_over$p0.05$b1_coverage),
+            mean(logit_case1_over$p0.25$b1_coverage),
+            mean(logit_case1_over$p0.5$b1_coverage),
+            mean(logit_case1_over$p0.75$b1_coverage),
+            mean(logit_case1_over$p0.95$b1_coverage)),
+           method=rep("Oversampled", 5),
+           beta=rep("beta[1]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_under$p0.05$b1_coverage),
+            mean(logit_case1_under$p0.25$b1_coverage),
+            mean(logit_case1_under$p0.5$b1_coverage),
+            mean(logit_case1_under$p0.75$b1_coverage),
+            mean(logit_case1_under$p0.95$b1_coverage)),
+           method=rep("Undersampled", 5),
+           beta=rep("beta[1]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_smote$p0.05$b1_coverage),
+            mean(logit_case1_smote$p0.25$b1_coverage),
+            mean(logit_case1_smote$p0.5$b1_coverage),
+            mean(logit_case1_smote$p0.75$b1_coverage),
+            mean(logit_case1_smote$p0.95$b1_coverage)),
+           method=rep("SMOTE", 5),
+           beta=rep("beta[1]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_raw$p0.05$b2_coverage),
+            mean(logit_case1_raw$p0.25$b2_coverage),
+            mean(logit_case1_raw$p0.5$b2_coverage),
+            mean(logit_case1_raw$p0.75$b2_coverage),
+            mean(logit_case1_raw$p0.95$b2_coverage)),
+           method=rep("None", 5),
+           beta=rep("beta[2]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_over$p0.05$b2_coverage),
+            mean(logit_case1_over$p0.25$b2_coverage),
+            mean(logit_case1_over$p0.5$b2_coverage),
+            mean(logit_case1_over$p0.75$b2_coverage),
+            mean(logit_case1_over$p0.95$b2_coverage)),
+           method=rep("Oversampled", 5),
+           beta=rep("beta[2]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_under$p0.05$b2_coverage),
+            mean(logit_case1_under$p0.25$b2_coverage),
+            mean(logit_case1_under$p0.5$b2_coverage),
+            mean(logit_case1_under$p0.75$b2_coverage),
+            mean(logit_case1_under$p0.95$b2_coverage)),
+           method=rep("Undersampled", 5),
+           beta=rep("beta[2]", 5)),
+data.frame(approx_p=desired_p,
+           coverage=c(mean(logit_case1_smote$p0.05$b2_coverage),
+            mean(logit_case1_smote$p0.25$b2_coverage),
+            mean(logit_case1_smote$p0.5$b2_coverage),
+            mean(logit_case1_smote$p0.75$b2_coverage),
+            mean(logit_case1_smote$p0.95$b2_coverage)),
+           method=rep("SMOTE", 5),
+           beta=rep("beta[2]", 5)))
+```
+
+```{r}
+# plot for one case (not used in presentation)
+ggplot(coverage_df[coverage_df$method=="None",], aes(x=approx_p, y=coverage, color=beta)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept=0.95, linetype='dashed')+
+  scale_color_manual(labels = c(expression(beta[1]), expression(beta[2])),values=c("#ffa500", "#487de7")) +
+  scale_x_continuous(breaks=c(0.05, 0.25, 0.5, 0.75, 0.95)) +
+  labs(x=expression("Approximate" ~ italic(p)~"in class 1"), y="Coverage Probability", color="Beta",
+       title=expression(beta~"Coverage Probability on Unbalanced Data for Case 1 ("*beta[1]~"= 0.5,"~beta[2]~"= 0.5)")) +
+  theme_bw()
+```
+
+```{r}
+# plot coverage visualization
+ggplot(coverage_df, aes(x=approx_p, y=coverage, color=method)) +
+  geom_hline(yintercept=0.95,linetype='dashed', col = '#e81416')+
+  geom_line() +
+  geom_point(size=2) +
+  labs(x=expression("Approximate" ~ italic(p)~"in class 1"), y="Coverage Probability",
+       color="Balancing method", 
+       title=expression("Coverage Probability for Case 1 ("*beta[1]~"= 0.5,"~beta[2]~"= 0.5)"))+
+  scale_y_continuous(breaks=c(0.4,0.6,0.8,0.95), limits=c(0.2, 0.97)) +
+  scale_x_continuous(breaks=c(0.05, 0.25, 0.5, 0.75, 0.95)) +
+  scale_color_manual(values=c("#ffa500", "#79c314", "#487de7","#70369d")) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  facet_wrap(vars(factor(beta)), labeller = label_parsed)
+```
+
+## Bias
+
+```{r}
+# data frame summarizing bias results
+bias_df <- rbind(data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case1_raw$p0.05$b1_bias), mean(logit_case1_raw$p0.25$b1_bias),
+            mean(logit_case1_raw$p0.5$b1_bias), mean(logit_case1_raw$p0.75$b1_bias),
+            mean(logit_case1_raw$p0.95$b1_bias)),
+           method=rep("None", 5), beta=rep("beta[1]", 5), case=rep("'Case 1:'~beta[1]~'='~beta[2]~'='~0.5", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case1_over$p0.05$b1_bias), mean(logit_case1_over$p0.25$b1_bias),
+            mean(logit_case1_over$p0.5$b1_bias), mean(logit_case1_over$p0.75$b1_bias),
+            mean(logit_case1_over$p0.95$b1_bias)),
+           method=rep("Oversampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 1:'~beta[1]~'='~beta[2]~'='~0.5", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case1_under$p0.05$b1_bias), mean(logit_case1_under$p0.25$b1_bias),
+            mean(logit_case1_under$p0.5$b1_bias), mean(logit_case1_under$p0.75$b1_bias),
+            mean(logit_case1_under$p0.95$b1_bias)),
+           method=rep("Undersampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 1:'~beta[1]~'='~beta[2]~'='~0.5", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case1_smote$p0.05$b1_bias), mean(logit_case1_smote$p0.25$b1_bias),
+            mean(logit_case1_smote$p0.5$b1_bias), mean(logit_case1_smote$p0.75$b1_bias),
+            mean(logit_case1_smote$p0.95$b1_bias)),
+           method=rep("SMOTE", 5), beta=rep("beta[1]", 5), case=rep("'Case 1:'~beta[1]~'='~beta[2]~'='~0.5", 5)),
+
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case2_raw$p0.05$b1_bias), mean(logit_case2_raw$p0.25$b1_bias),
+            mean(logit_case2_raw$p0.5$b1_bias), mean(logit_case2_raw$p0.75$b1_bias),
+            mean(logit_case2_raw$p0.95$b1_bias)),
+           method=rep("None", 5), beta=rep("beta[1]", 5), case=rep("'Case 2:'~beta[1]~'='~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case2_over$p0.05$b1_bias), mean(logit_case2_over$p0.25$b1_bias),
+            mean(logit_case2_over$p0.5$b1_bias), mean(logit_case2_over$p0.75$b1_bias),
+            mean(logit_case2_over$p0.95$b1_bias)),
+           method=rep("Oversampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 2:'~beta[1]~'='~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case2_under$p0.05$b1_bias), mean(logit_case2_under$p0.25$b1_bias),
+            mean(logit_case2_under$p0.5$b1_bias), mean(logit_case2_under$p0.75$b1_bias),
+            mean(logit_case2_under$p0.95$b1_bias)),
+           method=rep("Undersampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 2:'~beta[1]~'='~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case2_smote$p0.05$b1_bias), mean(logit_case2_smote$p0.25$b1_bias),
+            mean(logit_case2_smote$p0.5$b1_bias), mean(logit_case2_smote$p0.75$b1_bias),
+            mean(logit_case2_smote$p0.95$b1_bias)),
+           method=rep("SMOTE", 5), beta=rep("beta[1]", 5), case=rep("'Case 2:'~beta[1]~'='~beta[2]~'='~2", 5)),
+
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case3_raw$p0.05$b1_bias), mean(logit_case3_raw$p0.25$b1_bias),
+            mean(logit_case3_raw$p0.5$b1_bias), mean(logit_case3_raw$p0.75$b1_bias),
+            mean(logit_case3_raw$p0.95$b1_bias)),
+           method=rep("None", 5), beta=rep("beta[1]", 5), case=rep("'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case3_over$p0.05$b1_bias), mean(logit_case3_over$p0.25$b1_bias),
+            mean(logit_case3_over$p0.5$b1_bias), mean(logit_case3_over$p0.75$b1_bias),
+            mean(logit_case3_over$p0.95$b1_bias)),
+           method=rep("Oversampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case3_under$p0.05$b1_bias), mean(logit_case3_under$p0.25$b1_bias),
+            mean(logit_case3_under$p0.5$b1_bias), mean(logit_case3_under$p0.75$b1_bias),
+            mean(logit_case3_under$p0.95$b1_bias)),
+           method=rep("Undersampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case3_smote$p0.05$b1_bias), mean(logit_case3_smote$p0.25$b1_bias),
+            mean(logit_case3_smote$p0.5$b1_bias), mean(logit_case3_smote$p0.75$b1_bias),
+            mean(logit_case3_smote$p0.95$b1_bias)),
+           method=rep("SMOTE", 5), beta=rep("beta[1]", 5), case=rep("'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", 5)),
+
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case4_raw$p0.05$b1_bias), mean(logit_case4_raw$p0.25$b1_bias),
+            mean(logit_case4_raw$p0.5$b1_bias), mean(logit_case4_raw$p0.75$b1_bias),
+            mean(logit_case4_raw$p0.95$b1_bias)),
+           method=rep("None", 5), beta=rep("beta[1]", 5), case=rep("'Case 4:'~beta[1]~'=0, '~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case4_over$p0.05$b1_bias), mean(logit_case4_over$p0.25$b1_bias),
+            mean(logit_case4_over$p0.5$b1_bias), mean(logit_case4_over$p0.75$b1_bias),
+            mean(logit_case4_over$p0.95$b1_bias)),
+           method=rep("Oversampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 4:'~beta[1]~'=0, '~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case4_under$p0.05$b1_bias), mean(logit_case4_under$p0.25$b1_bias),
+            mean(logit_case4_under$p0.5$b1_bias), mean(logit_case4_under$p0.75$b1_bias),
+            mean(logit_case4_under$p0.95$b1_bias)),
+           method=rep("Undersampled", 5), beta=rep("beta[1]", 5), case=rep("'Case 4:'~beta[1]~'=0, '~beta[2]~'='~2", 5)),
+data.frame(approx_p=desired_p,
+           bias=c(mean(logit_case4_smote$p0.05$b1_bias), mean(logit_case4_smote$p0.25$b1_bias),
+            mean(logit_case4_smote$p0.5$b1_bias), mean(logit_case4_smote$p0.75$b1_bias),
+            mean(logit_case4_smote$p0.95$b1_bias)),
+           method=rep("SMOTE", 5), beta=rep("beta[1]", 5), case=rep("'Case 4:'~beta[1]~'=0, '~beta[2]~'='~2", 5)))
+
+bias_df
+```
+
+```{r}
+# plot bias results
+ggplot(bias_df, aes(x=approx_p, y=bias, color=method)) +
+  geom_hline(yintercept=0,linetype='dashed', col = '#e81416')+
+  geom_line() +
+  geom_point(size=2) +
+  labs(x=expression("Approximate" ~ italic(p)~"in class 1"), y=expression(beta[1]~"Bias"),
+       color="Balancing method")+
+  scale_x_continuous(breaks=c(0.05, 0.25, 0.5, 0.75, 0.95)) +
+  scale_color_manual(values=c("#ffa500", "#79c314", "#487de7","#70369d")) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  facet_wrap(vars(case), scales="free_y", labeller=label_parsed)
+```
+
+## Accuracy
+
+```{r}
+# function for summarizing accuracy results
+acc_summary <- function (df, model, resampling, case) {
+  if (model == "Logistic Regression") {
+    desired_p <- desired_p + 0.03
+  } else {
+    desired_p <- desired_p - 0.03
+  }
+  
+  summary_df <- data.frame(acc=c(mean(df$p0.05$test_acc, na.rm=TRUE),
+                              mean(df$p0.25$test_acc, na.rm=TRUE),
+                 mean(df$p0.5$test_acc, na.rm=TRUE),
+                 mean(df$p0.75$test_acc, na.rm=TRUE),
+                 mean(df$p0.95$test_acc, na.rm=TRUE)),
+           lower=c(quantile(df$p0.05$test_acc, 0.05, na.rm=TRUE),
+                   quantile(df$p0.25$test_acc, 0.05, na.rm=TRUE),
+                   quantile(df$p0.5$test_acc, 0.05, na.rm=TRUE),
+                   quantile(df$p0.75$test_acc, 0.05, na.rm=TRUE),
+                   quantile(df$p0.95$test_acc, 0.05, na.rm=TRUE)),
+           upper=c(quantile(df$p0.05$test_acc, 0.95, na.rm=TRUE),
+                   quantile(df$p0.25$test_acc, 0.95, na.rm=TRUE),
+                   quantile(df$p0.5$test_acc, 0.95, na.rm=TRUE),
+                   quantile(df$p0.75$test_acc, 0.95, na.rm=TRUE),
+                   quantile(df$p0.95$test_acc, 0.95, na.rm=TRUE)),
+           p=desired_p, Model=model, resampling=resampling, case=case)
+  
+  return(summary_df)
+}
+
+
+acc_df <- rbind(acc_summary(logit_case3_raw, "Logistic Regression", "None", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(logit_case4_raw, "Logistic Regression", "None", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(logit_case3_under, "Logistic Regression", "Undersampled", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(logit_case4_under, "Logistic Regression", "Undersampled", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(logit_case3_over, "Logistic Regression", "Oversampled", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(logit_case4_over, "Logistic Regression", "Oversampled", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(logit_case3_smote, "Logistic Regression", "SMOTE", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(logit_case4_smote, "Logistic Regression", "SMOTE", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(tree_case3_raw, "Decision Tree", "None", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(tree_case4_raw, "Decision Tree", "None", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(tree_case3_under, "Decision Tree", "Undersampled", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(tree_case4_under, "Decision Tree", "Undersampled", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(tree_case3_over, "Decision Tree", "Oversampled", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(tree_case4_over, "Decision Tree", "Oversampled", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"),
+      acc_summary(tree_case3_smote, "Decision Tree", "SMOTE", "'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0"),
+      acc_summary(tree_case4_smote, "Decision Tree", "SMOTE", "'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2"))
+
+```
+
+```{r}
+# accuracy results visualization
+ggplot(acc_df, aes(x=p, y=acc, color=Model)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.05) +
+  facet_grid(rows=vars(case), cols=vars(resampling), labeller = label_parsed) +
+  labs(x=expression("Approximate" ~ italic(p)~"in class 1"), y="Test Accuracy") +
+  scale_x_continuous(breaks=c(0.05, 0.25, 0.5, 0.75, 0.95)) +
+  scale_color_manual(values=c("#ffa500", "#487de7")) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+## Sensitivity / Specificity
+
+```{r}
+# summary of sensitvitiy and specificity results
+metric_summary <- function(df, case, resampling) {
+  summary_df <- rbind(data.frame(stat=mean(df$p0.05$test_sensitivity, na.rm=TRUE), p=0.05,
+           lower=quantile(df$p0.05$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.05$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.25$test_sensitivity, na.rm=TRUE), p=0.25,
+           lower=quantile(df$p0.25$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.25$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.5$test_sensitivity, na.rm=TRUE), p=0.5, 
+           lower=quantile(df$p0.5$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.5$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.75$test_sensitivity, na.rm=TRUE), p=0.75,
+           lower=quantile(df$p0.75$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.75$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.95$test_sensitivity, na.rm=TRUE), p=0.95,  
+           lower=quantile(df$p0.95$test_sensitivity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.95$test_sensitivity, 0.95, na.rm=TRUE),
+           metric="sensitivity", case=case, resampling=resampling),
+
+data.frame(stat=mean(df$p0.05$test_specficity, na.rm=TRUE), p=0.05, 
+           lower=quantile(df$p0.05$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.05$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.25$test_specficity, na.rm=TRUE), p=0.25, 
+           lower=quantile(df$p0.25$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.25$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.5$test_specficity, na.rm=TRUE), p=0.5,
+           lower=quantile(df$p0.5$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.5$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.75$test_specficity, na.rm=TRUE), p=0.75,
+           lower=quantile(df$p0.75$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.75$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity", case=case, resampling=resampling),
+data.frame(stat=mean(df$p0.95$test_specficity, na.rm=TRUE), p=0.95,
+           lower=quantile(df$p0.95$test_specficity, 0.05, na.rm=TRUE), 
+           upper=quantile(df$p0.95$test_specficity, 0.95, na.rm=TRUE),
+           metric="specificity", case=case, resampling=resampling))
+
+return(summary_df)
+}
+
+metrics_df <- rbind(metric_summary(logit_case3_raw, case="'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", resampling="None"),
+                    metric_summary(logit_case3_over, case="'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", resampling="Oversampled"),
+                    metric_summary(logit_case3_under, case="'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", 
+                                   resampling="Undersampled"),
+                    metric_summary(logit_case3_smote, case="'Case 3:'~beta[1]~'=2,'~beta[2]~'='~0", resampling="SMOTE"),
+                    metric_summary(logit_case4_raw, case="'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2", resampling="None"),
+                    metric_summary(logit_case4_over, case="'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2", resampling="Oversampled"),
+                    metric_summary(logit_case4_under, case="'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2", 
+                                   resampling="Undersampled"),
+                    metric_summary(logit_case4_smote, case="'Case 4:'~beta[1]~'=0,'~beta[2]~'='~2", resampling="SMOTE"))
+```
+
+```{r}
+# visualization for sensitivity/specificity
+ggplot(metrics_df, aes(x=p, y=stat, color=metric)) +
+  geom_point() +
+  geom_line() +
+  facet_grid(cols=vars(resampling),rows=vars(case), labeller=label_parsed) +
+  scale_x_continuous(breaks=c(0.05, 0.25, 0.5, 0.75, 0.95), limits=c(0.03, 0.97)) +
+  scale_color_manual(values=c("#79c314", "#70369d")) +
+  labs(x=expression("Approximate" ~ italic(p)~"in class 1"), y="Score on Test Data", color="Metric") +
+  theme_bw() +
+  theme(legend.position="bottom")
+```
+
